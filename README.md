@@ -38,3 +38,17 @@ Changes compared to `main_new.py`:
 - **Session + track as a unique key.** Track ids restart in every session, so the session folder name (start time) together with the track id uniquely identifies one person visit.
 - `metadata.csv` keeps the same columns; `person_file` and `face_file` now contain the new relative paths (`track_XXXX/persons/...`, `track_XXXX/faces/...`).
 - Module docstring updated to describe the new layout.
+
+## update main_new.py: resolution-independent overlay
+
+Changes compared to `main_new_1.py`:
+
+- **Constant on-screen overlay size.** Fonts, line thickness and paddings are multiplied by `ui_scale()` (frame pixels per screen pixel, based on the real window width via `cv2.getWindowImageRect`). Text and boxes keep the same visible size for any stream resolution (e.g. 4K) and any window size. If OpenCV cannot report the window size, `UI_REF_WIDTH` is used as a fallback.
+- **Resizable window with correct aspect ratio.** The window is created with `WINDOW_KEEPRATIO` and an initial width of `WINDOW_INIT_WIDTH` (1280 px). After the first frame its height is adjusted once to the stream's aspect ratio.
+- **New bounding box labels.** `draw_label` draws a filled label (dark text on the box color) above the box. If there is no room above, the label is placed inside the box, and it is always kept within the frame.
+- **New status bar.** `draw_status` replaces the full-width top bar with a compact semi-transparent panel in the top-right corner. It has two right-aligned lines:
+  - resolution (source -> analysis), FPS, YOLO and face detection time;
+  - person and face counts, plus saved tracks and pairs.
+  The font shrinks automatically on very narrow frames.
+- **"NO SIGNAL" screen.** The placeholder now has a 16:9 height computed from the width and uses the same scaling as the rest of the overlay.
+- **Overlay settings.** New constants: `WINDOW_INIT_WIDTH`, `UI_REF_WIDTH`, `FONT`, `BOX_FONT`, `BOX_LINE`, `STATUS_FONT`. Below-threshold faces are now drawn in a lighter gray (150, 150, 150) for better visibility.
