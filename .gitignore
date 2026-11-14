@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+.venv/
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+.env
+.vscode/
+.venv_face_detect/
+*.zip
+config.py
+dataset/
+*.old
