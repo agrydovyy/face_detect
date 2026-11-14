@@ -30,6 +30,17 @@ Every tracked person with a good face is compared with the gallery built by
 face_id.py (ArcFace); the track label is a majority vote over recent frames.
 Known people are drawn as "#3 Name 0.62", others as "#3 Person 0.91" in orange.
 
+Identification does NOT filter the dataset: known and unknown people are all
+saved. Two extra columns in metadata.csv tell them apart later:
+
+  identity        'Name' | 'Unknown' | 'pending' (no label yet); empty if
+                  identification is off (no --identify / --gallery)
+  identity_score  similarity to that identity (see face_id.py), empty if none
+
+The label is the one the track had at the moment of saving (a majority vote
+over recent frames), so early samples of a track can be wrong; for dataset
+preparation prefer the most frequent identity of the whole track.
+
 Other points
 ------------
 - A background thread reads the stream and keeps only the latest frame,
@@ -101,7 +112,7 @@ PERSON_MARGIN = 0.05      # extra margin around the person box (fraction)
 SKIP_EDGE_PERSONS = False  # True: also skip people cut by the frame border
 EDGE_PX = 3
 
-MIN_FACE_SIDE = 75        # px, in the ORIGINAL frame (48px old value)
+MIN_FACE_SIDE = 80        # px, in the ORIGINAL frame
 FACE_MARGIN = 0.25        # extra margin around the face box (fraction)
 
 # Blur filter for the face: Laplacian variance of the crop downscaled to
@@ -197,7 +208,7 @@ META_HEADER = ['time', 'frame_seq', 'track_id', 'person_file', 'face_file',
                'person_x1', 'person_y1', 'person_x2', 'person_y2',
                'face_x1', 'face_y1', 'face_x2', 'face_y2',
                'person_conf', 'face_score', 'person_sharp', 'face_sharp',
-               'src_w', 'src_h']
+               'src_w', 'src_h', 'identity', 'identity_score']
 
 
 def sharpness(img):
@@ -246,8 +257,12 @@ class DatasetSaver:
         return len(self._counts)
 
     def try_save_pair(self, tid, frame, person_box, face_box,
-                      person_conf, face_score, seq, now):
-        """Boxes are in ORIGINAL frame coords. Returns True if the pair was queued."""
+                      person_conf, face_score, seq, now, identity=None):
+        """Boxes are in ORIGINAL frame coords. Returns True if the pair was queued.
+
+        identity: (name, score) of the track at the moment of saving, written to
+        metadata.csv. None = identification is off (empty columns).
+        """
         if self._counts.get(tid, 0) >= MAX_PER_TRACK:
             return False
         if now - self._last.get(tid, 0.0) < SAVE_INTERVAL_S:
@@ -270,10 +285,16 @@ class DatasetSaver:
         src_h, src_w = frame.shape[:2]
         pb = [int(v) for v in person_box]
         fb = [int(v) for v in face_box]
+        if identity is None:
+            id_name, id_score = '', ''
+        else:
+            id_name = identity[0]
+            id_score = '' if identity[1] is None else f'{identity[1]:.3f}'
         row = [datetime.fromtimestamp(now).isoformat(timespec='milliseconds'),
                seq, tid, rel_person.as_posix(), rel_face.as_posix(),
                *pb, *fb, f'{person_conf:.3f}', f'{face_score:.3f}',
-               f'{person_sharp:.1f}', f'{face_sharp:.1f}', src_w, src_h]
+               f'{person_sharp:.1f}', f'{face_sharp:.1f}', src_w, src_h,
+               id_name, id_score]
         # .copy(): the frame is modified later by drawing.
         item = ([(self.root / rel_person, person_crop.copy()),
                  (self.root / rel_face, face_crop.copy())], row)
@@ -284,7 +305,8 @@ class DatasetSaver:
             return False
 
         if tid not in self._counts:
-            print(f'[DATASET] New track #{tid}: face {face_score:.2f}')
+            who = f', identity: {id_name}' if id_name else ''
+            print(f'[DATASET] New track #{tid}: face {face_score:.2f}{who}')
         self._last[tid] = now
         self._counts[tid] = self._counts.get(tid, 0) + 1
         self.pairs += 1
@@ -344,13 +366,15 @@ def assign_faces_to_persons(faces, boxes):
 
 
 def save_detections(saver, frame, boxes, confs, ids, faces, scale, seq,
-                    face_score_min):
+                    face_score_min, identifier=None):
     """Save (person, face) pairs, but only for persons that have a good face.
 
     boxes/faces are in 'small' coordinates; scale converts them to the original.
     Must be called BEFORE drawing (with PROCESS_WIDTH >= source width the
     small frame is the same array as the original one).
     A person without a face (or with a face below face_score_min) is skipped.
+    Everyone is saved, known or not; with an identifier the current label of
+    the track ('Name', 'Unknown' or 'pending') goes into metadata.csv.
     """
     now = time.time()
     frame_h, frame_w = frame.shape[:2]
@@ -377,8 +401,14 @@ def save_detections(saver, frame, boxes, confs, ids, faces, scale, seq,
                 person_box[2] >= frame_w - EDGE_PX or person_box[3] >= frame_h - EDGE_PX):
             continue
 
+        identity = None
+        if identifier is not None:
+            who = identifier.label(tid)
+            identity = who if who is not None else ('pending', None)
+
         saver.try_save_pair(tid, frame, person_box, face_box,
-                            person_conf, float(score), seq, now)
+                            person_conf, float(score), seq, now,
+                            identity=identity)
 
 
 # --------------------------------------------------------------------------
@@ -677,12 +707,8 @@ def main():
                 faces = detect_faces_full(face_detector, small, scale)
             t_face = time.perf_counter()
 
-            # --- Save pairs (BEFORE drawing: small may be the same array as frame) ---
-            if saver is not None:
-                save_detections(saver, frame, xyxy, confs, ids, faces, scale,
-                                last_seq, face_score_min)
-
-            # --- Identify (BEFORE drawing: needs clean pixels) ---
+            # --- Identify (BEFORE saving and drawing: needs clean pixels, and the
+            #     saved sample should already carry the track's label) ---
             if identifier is not None:
                 now_t = time.time()
                 for i, face in assign_faces_to_persons(faces, xyxy).items():
@@ -692,6 +718,11 @@ def main():
                             or not identifier.due(tid, now_t)):
                         continue
                     identifier.update(tid, frame, face.lm, now_t)
+
+            # --- Save pairs (BEFORE drawing: small may be the same array as frame) ---
+            if saver is not None:
+                save_detections(saver, frame, xyxy, confs, ids, faces, scale,
+                                last_seq, face_score_min, identifier)
 
             # --- Overlay (sizes follow the real window size) ---
             if not window_sized:  # match window aspect ratio to the stream once
