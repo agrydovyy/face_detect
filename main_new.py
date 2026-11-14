@@ -98,6 +98,17 @@ MIN_SHARP_FACE = 15.0
 
 WINDOW = 'RTSP 4K | Persons + Faces | Q/ESC=exit'
 
+# ---- Overlay sizing -------------------------------------------------------
+# Sizes below are "as seen on screen". They are multiplied by ui_scale()
+# (frame pixels per screen pixel), so text and boxes keep the same visible
+# size for any stream resolution and any window size.
+WINDOW_INIT_WIDTH = 1280  # initial window width (you can resize the window)
+UI_REF_WIDTH = 1280       # fallback window width if OpenCV cannot report it
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+BOX_FONT = 0.55           # label font scale
+BOX_LINE = 2              # bounding box line thickness
+STATUS_FONT = 0.6         # status bar font scale
+
 
 # --------------------------------------------------------------------------
 # Stream reader
@@ -365,7 +376,37 @@ def resize_to_width(image, width):
                       interpolation=cv2.INTER_AREA)
 
 
-def draw_box(frame, coords, label, color):
+def ui_scale(frame_w):
+    """Frame pixels per screen pixel: keeps overlay size constant on screen."""
+    win_w = 0
+    try:
+        win_w = cv2.getWindowImageRect(WINDOW)[2]
+    except Exception:
+        pass
+    if win_w < 200:  # window not created yet / backend cannot report size
+        win_w = UI_REF_WIDTH
+    return float(np.clip(frame_w / win_w, 0.4, 8.0))
+
+
+def draw_label(frame, text, x, y, color, ui):
+    """Filled label (dark text on the box color) above point (x, y)."""
+    fs = BOX_FONT * ui
+    th = max(1, round(ui))
+    (tw, tth), base = cv2.getTextSize(text, FONT, fs, th)
+    pad = max(2, round(3 * ui))
+    box_w, box_h = tw + 2 * pad, tth + base + 2 * pad
+    height, width = frame.shape[:2]
+    top = y - box_h
+    if top < 0:                      # no room above: put it inside the box
+        top = y
+    top = int(max(0, min(top, height - box_h)))
+    left = int(max(0, min(x, width - box_w)))
+    cv2.rectangle(frame, (left, top), (left + box_w, top + box_h), color, -1)
+    cv2.putText(frame, text, (left + pad, top + pad + tth), FONT, fs,
+                (0, 0, 0), th, cv2.LINE_AA)
+
+
+def draw_box(frame, coords, label, color, ui=1.0):
     x1, y1, x2, y2 = map(int, coords)
     height, width = frame.shape[:2]
     x1 = max(0, min(x1, width - 1))
@@ -374,21 +415,60 @@ def draw_box(frame, coords, label, color):
     y2 = max(0, min(y2, height - 1))
     if x2 <= x1 or y2 <= y1:
         return
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(frame, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, color, 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, max(1, round(BOX_LINE * ui)))
+    draw_label(frame, label, x1, y1, color, ui)
 
 
-def draw_stats(frame, text):
-    cv2.rectangle(frame, (0, 0), (frame.shape[1], 28), (20, 20, 20), -1)
-    cv2.putText(frame, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, (255, 255, 255), 1, cv2.LINE_AA)
+def draw_status(frame, lines, ui):
+    """Semi-transparent status bar in the top-right corner, one text per line."""
+    height, width = frame.shape[:2]
+    fs = STATUS_FONT * ui
+    th = max(1, round(ui))
+    margin = max(4, round(8 * ui))
+    pad = max(3, round(6 * ui))
+    gap = max(2, round(6 * ui))
+
+    def measure(fs, th):
+        return [cv2.getTextSize(t, FONT, fs, th) for t in lines]
+
+    sizes = measure(fs, th)
+    max_w = max(sz[0][0] for sz in sizes)
+    avail = width - 2 * (margin + pad)
+    if max_w > avail > 0:            # very narrow frame: shrink the font
+        k = avail / max_w
+        fs *= k
+        th = max(1, round(th * k))
+        sizes = measure(fs, th)
+        max_w = max(sz[0][0] for sz in sizes)
+
+    line_h = max(sz[0][1] + sz[1] for sz in sizes)
+    box_w = max_w + 2 * pad
+    box_h = len(lines) * line_h + (len(lines) - 1) * gap + 2 * pad
+    x2 = width - margin
+    x1 = max(0, x2 - box_w)
+    y1 = margin
+    y2 = min(height, y1 + box_h)
+
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return
+    dark = np.full_like(roi, 20)
+    frame[y1:y2, x1:x2] = cv2.addWeighted(dark, 0.65, roi, 0.35, 0)
+
+    for i, (text, sz) in enumerate(zip(lines, sizes)):
+        x = x2 - pad - sz[0][0]      # right-aligned
+        y = y1 + pad + i * (line_h + gap) + sz[0][1]
+        cv2.putText(frame, text, (int(x), int(y)), FONT, fs,
+                    (255, 255, 255), th, cv2.LINE_AA)
 
 
-def no_signal_canvas(width=PROCESS_WIDTH, height=720):
+def no_signal_canvas(width=PROCESS_WIDTH):
+    height = round(width * 9 / 16)
     canvas = np.zeros((height, width, 3), np.uint8)
-    cv2.putText(canvas, 'NO SIGNAL - reconnecting...', (40, height // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
+    ui = ui_scale(width)
+    cv2.putText(canvas, 'NO SIGNAL - reconnecting...',
+                (round(40 * ui), height // 2), FONT, 1.0 * ui, (0, 0, 255),
+                max(1, round(2 * ui)), cv2.LINE_AA)
     return canvas
 
 
@@ -484,7 +564,8 @@ def main():
 
     saver = DatasetSaver(DATASET_DIR) if SAVE_DATASET else None
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(WINDOW, WINDOW_INIT_WIDTH, round(WINDOW_INIT_WIDTH * 9 / 16))
     print('[INFO] Press Q or ESC to exit')
 
     reader = StreamReader(rtsp_url)
@@ -492,6 +573,7 @@ def main():
 
     last_seq = 0
     shown_once = False
+    window_sized = False
     showing_no_signal = False
     fps_ema = 0.0
     last_loop = time.perf_counter()
@@ -551,13 +633,20 @@ def main():
                 save_detections(saver, frame, xyxy, confs, ids, faces, scale,
                                 last_seq, face_score_min)
 
-            # --- Draw on the small frame ---
+            # --- Overlay (sizes follow the real window size) ---
+            if not window_sized:  # match window aspect ratio to the stream once
+                cv2.resizeWindow(WINDOW, WINDOW_INIT_WIDTH,
+                                 round(WINDOW_INIT_WIDTH * h / w))
+                window_sized = True
+            ui = ui_scale(w)
+
             for box, conf, tid in zip(xyxy, confs, ids):
                 tag = f'#{int(tid)} ' if tid >= 0 else ''
-                draw_box(small, box, f'{tag}Person {conf:.2f}', (0, 220, 0))
+                draw_box(small, box, f'{tag}Person {conf:.2f}', (0, 220, 0), ui)
             for (x, y, fw, fh, score) in faces:
-                color = (255, 180, 0) if score >= face_score_min else (120, 120, 120)
-                draw_box(small, (x, y, x + fw, y + fh), f'Face {score:.2f}', color)
+                color = (255, 180, 0) if score >= face_score_min else (150, 150, 150)
+                draw_box(small, (x, y, x + fw, y + fh), f'Face {score:.2f}',
+                         color, ui)
 
             # FPS over the whole loop (includes decode wait, display, waitKey).
             now = time.perf_counter()
@@ -565,14 +654,13 @@ def main():
             last_loop = now
             fps_ema = inst_fps if fps_ema == 0 else 0.9 * fps_ema + 0.1 * inst_fps
 
-            stats = (f'Src {orig_w}x{orig_h} | Analyze {w}x{h} | '
-                     f'P {len(xyxy)} F {len(faces)} | '
-                     f'YOLO {1000 * (t_yolo - t0):.0f}ms | '
-                     f'Face {1000 * (t_face - t_yolo):.0f}ms | '
-                     f'{fps_ema:.1f} FPS')
+            line1 = (f'{orig_w}x{orig_h} -> {w}x{h} | {fps_ema:.1f} FPS | '
+                     f'YOLO {1000 * (t_yolo - t0):.0f} ms | '
+                     f'Face {1000 * (t_face - t_yolo):.0f} ms')
+            line2 = f'Persons {len(xyxy)} | Faces {len(faces)}'
             if saver is not None:
-                stats += f' | Saved: {saver.tracks} tracks, {saver.pairs} pairs'
-            draw_stats(small, stats)
+                line2 += f' | Saved: {saver.tracks} tracks, {saver.pairs} pairs'
+            draw_status(small, [line1, line2], ui)
 
             cv2.imshow(WINDOW, small)
             shown_once = True
