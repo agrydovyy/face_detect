@@ -9,13 +9,14 @@ without a (good) face is never saved.
 
 Each sample is a pair cut from the ORIGINAL full-resolution frame:
 
-    dataset/<session>/persons/track_0001/f00001234.jpg   person bounding box
-    dataset/<session>/faces/track_0001/f00001234.jpg     face bounding box
-    dataset/<session>/metadata.csv                       both boxes + scores
+    dataset/<YYYYMMDD_HHMMSS>/track_0001/persons/f00001234.jpg   person box
+    dataset/<YYYYMMDD_HHMMSS>/track_0001/faces/f00001234.jpg     face box
+    dataset/<YYYYMMDD_HHMMSS>/metadata.csv                       both boxes + scores
 
-Same file name in persons/ and faces/ = same frame. One folder per track id
-(ImageFolder-compatible). A track folder appears when the track gets its
-first valid face.
+<YYYYMMDD_HHMMSS> is the session start time. Track ids restart in every
+session, so session + track is the unique key of one "person visit".
+Same file name in persons/ and faces/ = same frame. A track folder appears
+when the track gets its first valid face.
 
 Changing the face probability threshold
 ---------------------------------------
@@ -236,8 +237,9 @@ class DatasetSaver:
         person_sharp = sharpness(person_crop)
 
         name = f'f{seq:08d}.jpg'
-        rel_person = Path('persons') / f'track_{tid:04d}' / name
-        rel_face = Path('faces') / f'track_{tid:04d}' / name
+        track_dir = Path(f'track_{tid:04d}')
+        rel_person = track_dir / 'persons' / name
+        rel_face = track_dir / 'faces' / name
         src_h, src_w = frame.shape[:2]
         pb = [int(v) for v in person_box]
         fb = [int(v) for v in face_box]
