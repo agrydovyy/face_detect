@@ -1,24 +1,36 @@
 """Single 4K RTSP camera: person (YOLO + tracker) and face (YuNet) detection
-with automatic dataset collection.
+with automatic dataset collection for future person identification.
 
-Key points:
+What gets saved
+---------------
+A sample is saved ONLY when a person is tracked AND a face inside that person
+is detected with score >= FACE_SAVE_SCORE (default 0.80, see below). A person
+without a (good) face is never saved.
+
+Each sample is a pair cut from the ORIGINAL full-resolution frame:
+
+    dataset/<session>/persons/track_0001/f00001234.jpg   person bounding box
+    dataset/<session>/faces/track_0001/f00001234.jpg     face bounding box
+    dataset/<session>/metadata.csv                       both boxes + scores
+
+Same file name in persons/ and faces/ = same frame. One folder per track id
+(ImageFolder-compatible). A track folder appears when the track gets its
+first valid face.
+
+Changing the face probability threshold
+---------------------------------------
+- edit FACE_SAVE_SCORE below, or
+- run:  python main_new.py --face-score 0.9
+
+Other points
+------------
 - A background thread reads the stream and keeps only the latest frame,
   so latency does not build up and the UI never blocks on the camera.
 - Open/read timeouts + automatic reconnect inside the reader thread.
 - Q / ESC / closing the window always work, even when the camera is down.
-- Persons are tracked (ByteTrack), so every person gets a track id.
-- For every track, person crops and face crops are cut from the ORIGINAL
-  full-resolution frame and saved by a background writer thread:
-
-    dataset/<session>/persons/track_0001/f00001234.jpg
-    dataset/<session>/faces/track_0001/f00001234.jpg
-    dataset/<session>/metadata.csv
-
-  The same file name in persons/ and faces/ means "same frame".
-  Folder per track = ImageFolder-compatible, easy to merge/label later.
-- Saving is throttled and quality-filtered (size, confidence, sharpness,
-  not cut by the frame edge) so you do not get thousands of duplicates.
+- Disk writing runs in a separate thread and never slows down detection.
 """
+import argparse
 import csv
 import os
 import queue
@@ -41,11 +53,12 @@ YUNET_PATH = BASE / 'models' / 'face_detection_yunet_2023mar.onnx'
 MODEL_NAME = 'yolo11n.pt'
 TRACKER = 'bytetrack.yaml'
 
-# Analysis AND display width (1280 / 1600 = faster, 3840 = full 4K, slow).
+# Analysis AND display width (1280 / 1920 = faster, 3840 = full 4K, slow).
 PROCESS_WIDTH = 3840
 YOLO_IMGSZ = PROCESS_WIDTH  # keep equal to PROCESS_WIDTH, multiple of 32
 PERSON_CONF = 0.35
-FACE_CONF = 0.70
+FACE_CONF = 0.70          # YuNet detection threshold (auto-lowered if
+                          # FACE_SAVE_SCORE is lower, see main())
 RETRY_SECONDS = 3
 TIMEOUT_MS = 5000
 
@@ -59,24 +72,27 @@ MIN_CROP_SIDE = 40        # skip crops smaller than this (px, original frame)
 # ---- Dataset collection -------------------------------------------------
 SAVE_DATASET = True
 DATASET_DIR = BASE / 'dataset'
-SAVE_INTERVAL_S = 1.0     # min seconds between saves for one track and kind
-MAX_PER_TRACK = 60        # max images per track and kind (per session)
-JPEG_QUALITY = 95
-QUEUE_SIZE = 64           # if the disk is slower, extra images are dropped
 
-PERSON_SAVE_CONF = 0.50
+# Save a sample only if the face probability is at least this value (0..1).
+# Can be overridden from the command line: --face-score 0.9
+FACE_SAVE_SCORE = 0.80
+
+SAVE_INTERVAL_S = 1.0     # min seconds between saved samples of one track
+MAX_PER_TRACK = 60        # max samples (person+face pairs) per track/session
+JPEG_QUALITY = 95
+QUEUE_SIZE = 64           # if the disk is slower, extra samples are dropped
+
+PERSON_SAVE_CONF = 0.50   # YOLO confidence of the person box
 MIN_PERSON_H = 160        # px, in the ORIGINAL frame
-PERSON_MARGIN = 0.05      # extra margin around the box (fraction)
-SKIP_EDGE_PERSONS = True  # skip people cut by the frame border
+PERSON_MARGIN = 0.05      # extra margin around the person box (fraction)
+SKIP_EDGE_PERSONS = False  # True: also skip people cut by the frame border
 EDGE_PX = 3
 
-FACE_SAVE_SCORE = 0.80
 MIN_FACE_SIDE = 48        # px, in the ORIGINAL frame
-FACE_MARGIN = 0.25
+FACE_MARGIN = 0.25        # extra margin around the face box (fraction)
 
-# Blur filter: Laplacian variance of the crop downscaled to <=128 px.
-# Values are written to metadata.csv, so tune these after a first run.
-MIN_SHARP_PERSON = 8.0
+# Blur filter for the face: Laplacian variance of the crop downscaled to
+# <=128 px. Values are written to metadata.csv, so tune after a first run.
 MIN_SHARP_FACE = 15.0
 
 WINDOW = 'RTSP 4K | Persons + Faces | Q/ESC=exit'
@@ -149,9 +165,11 @@ class StreamReader(threading.Thread):
 # --------------------------------------------------------------------------
 # Dataset saving
 # --------------------------------------------------------------------------
-META_HEADER = ['time', 'frame_seq', 'kind', 'track_id', 'file',
-               'crop_x1', 'crop_y1', 'crop_x2', 'crop_y2',
-               'score', 'sharpness', 'src_w', 'src_h']
+META_HEADER = ['time', 'frame_seq', 'track_id', 'person_file', 'face_file',
+               'person_x1', 'person_y1', 'person_x2', 'person_y2',
+               'face_x1', 'face_y1', 'face_x2', 'face_y2',
+               'person_conf', 'face_score', 'person_sharp', 'face_sharp',
+               'src_w', 'src_h']
 
 
 def sharpness(img):
@@ -164,7 +182,7 @@ def sharpness(img):
 
 
 def crop_with_margin(frame, box, margin):
-    """Crop box (x1, y1, x2, y2 in frame coords) + margin. Returns (crop, coords) or None."""
+    """Crop box (x1, y1, x2, y2 in frame coords) + margin. Returns crop or None."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
@@ -174,11 +192,11 @@ def crop_with_margin(frame, box, margin):
     cy2 = int(min(h, y2 + bh * margin))
     if cx2 - cx1 < 8 or cy2 - cy1 < 8:
         return None
-    return frame[cy1:cy2, cx1:cx2], (cx1, cy1, cx2, cy2)
+    return frame[cy1:cy2, cx1:cx2]
 
 
 class DatasetSaver:
-    """Throttled, quality-filtered saving of crops. Disk I/O runs in its own thread."""
+    """Throttled saving of (person, face) pairs. Disk I/O runs in its own thread."""
 
     def __init__(self, root):
         session = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -186,49 +204,61 @@ class DatasetSaver:
         self.root.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.root / 'metadata.csv'
         self._q = queue.Queue(maxsize=QUEUE_SIZE)
-        self._last = {}     # (kind, track_id) -> last save time
-        self._counts = {}   # (kind, track_id) -> saved images
-        self.totals = {'person': 0, 'face': 0}
+        self._last = {}     # track_id -> last save time
+        self._counts = {}   # track_id -> saved samples
+        self.pairs = 0
         self.dropped = 0
         # Not a daemon: on exit we wait until the queue is written out.
         self._thread = threading.Thread(target=self._run, name='DatasetWriter')
         self._thread.start()
         print(f'[DATASET] Saving to {self.root}')
 
-    def try_save(self, kind, tid, frame, box, score, seq, now):
-        """kind: 'person' | 'face'; box in ORIGINAL frame coords. Returns True if queued."""
-        key = (kind, tid)
-        if self._counts.get(key, 0) >= MAX_PER_TRACK:
+    @property
+    def tracks(self):
+        return len(self._counts)
+
+    def try_save_pair(self, tid, frame, person_box, face_box,
+                      person_conf, face_score, seq, now):
+        """Boxes are in ORIGINAL frame coords. Returns True if the pair was queued."""
+        if self._counts.get(tid, 0) >= MAX_PER_TRACK:
             return False
-        if now - self._last.get(key, 0.0) < SAVE_INTERVAL_S:
+        if now - self._last.get(tid, 0.0) < SAVE_INTERVAL_S:
             return False
 
-        margin = PERSON_MARGIN if kind == 'person' else FACE_MARGIN
-        res = crop_with_margin(frame, box, margin)
-        if res is None:
-            return False
-        crop, (cx1, cy1, cx2, cy2) = res
-
-        sharp = sharpness(crop)
-        min_sharp = MIN_SHARP_PERSON if kind == 'person' else MIN_SHARP_FACE
-        if sharp < min_sharp:
+        person_crop = crop_with_margin(frame, person_box, PERSON_MARGIN)
+        face_crop = crop_with_margin(frame, face_box, FACE_MARGIN)
+        if person_crop is None or face_crop is None:
             return False
 
-        rel = Path(f'{kind}s') / f'track_{tid:04d}' / f'f{seq:08d}.jpg'
+        face_sharp = sharpness(face_crop)
+        if face_sharp < MIN_SHARP_FACE:
+            return False
+        person_sharp = sharpness(person_crop)
+
+        name = f'f{seq:08d}.jpg'
+        rel_person = Path('persons') / f'track_{tid:04d}' / name
+        rel_face = Path('faces') / f'track_{tid:04d}' / name
         src_h, src_w = frame.shape[:2]
+        pb = [int(v) for v in person_box]
+        fb = [int(v) for v in face_box]
         row = [datetime.fromtimestamp(now).isoformat(timespec='milliseconds'),
-               seq, kind, tid, rel.as_posix(), cx1, cy1, cx2, cy2,
-               f'{score:.3f}', f'{sharp:.1f}', src_w, src_h]
+               seq, tid, rel_person.as_posix(), rel_face.as_posix(),
+               *pb, *fb, f'{person_conf:.3f}', f'{face_score:.3f}',
+               f'{person_sharp:.1f}', f'{face_sharp:.1f}', src_w, src_h]
+        # .copy(): the frame is modified later by drawing.
+        item = ([(self.root / rel_person, person_crop.copy()),
+                 (self.root / rel_face, face_crop.copy())], row)
         try:
-            # .copy(): the frame is modified later by drawing.
-            self._q.put_nowait((self.root / rel, crop.copy(), row))
+            self._q.put_nowait(item)
         except queue.Full:
             self.dropped += 1
             return False
 
-        self._last[key] = now
-        self._counts[key] = self._counts.get(key, 0) + 1
-        self.totals[kind] += 1
+        if tid not in self._counts:
+            print(f'[DATASET] New track #{tid}: face {face_score:.2f}')
+        self._last[tid] = now
+        self._counts[tid] = self._counts.get(tid, 0) + 1
+        self.pairs += 1
         return True
 
     def _run(self):
@@ -241,14 +271,15 @@ class DatasetSaver:
                 item = self._q.get()
                 if item is None:
                     break
-                path, img, row = item
+                images, row = item
                 try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    ok, buf = cv2.imencode('.jpg', img,
-                                           [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                    if not ok:
-                        continue
-                    path.write_bytes(buf.tobytes())  # works with non-ASCII paths
+                    for path, img in images:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        ok, buf = cv2.imencode(
+                            '.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                        if not ok:
+                            raise OSError(f'JPEG encode failed: {path.name}')
+                        path.write_bytes(buf.tobytes())  # works with non-ASCII paths
                     writer.writerow(row)
                     f.flush()
                 except OSError as e:
@@ -257,8 +288,8 @@ class DatasetSaver:
     def close(self):
         self._q.put(None)
         self._thread.join()
-        print(f'[DATASET] Done: {self.totals["person"]} person, '
-              f'{self.totals["face"]} face images, dropped: {self.dropped}')
+        print(f'[DATASET] Done: {self.tracks} tracks, {self.pairs} person+face '
+              f'pairs, dropped: {self.dropped}')
 
 
 def assign_faces_to_persons(faces, boxes):
@@ -283,38 +314,42 @@ def assign_faces_to_persons(faces, boxes):
     return best
 
 
-def save_detections(saver, frame, boxes, confs, ids, faces, scale, seq):
-    """Cut crops from the ORIGINAL frame and hand them to the saver.
+def save_detections(saver, frame, boxes, confs, ids, faces, scale, seq,
+                    face_score_min):
+    """Save (person, face) pairs, but only for persons that have a good face.
 
     boxes/faces are in 'small' coordinates; scale converts them to the original.
     Must be called BEFORE drawing (with PROCESS_WIDTH >= source width the
     small frame is the same array as the original one).
+    A person without a face (or with a face below face_score_min) is skipped.
     """
     now = time.time()
     frame_h, frame_w = frame.shape[:2]
     face_of = assign_faces_to_persons(faces, boxes)
 
-    for i, (box, conf, tid) in enumerate(zip(boxes, confs, ids)):
-        tid = int(tid)
+    for i, face in face_of.items():
+        tid = int(ids[i])
         if tid < 0:
             continue  # tracker has not assigned an id yet
 
-        ob = np.asarray(box, dtype=np.float32) * scale
-        person_h = ob[3] - ob[1]
-        cut = (ob[0] <= EDGE_PX or ob[1] <= EDGE_PX or
-               ob[2] >= frame_w - EDGE_PX or ob[3] >= frame_h - EDGE_PX)
+        x, y, fw, fh, score = face
+        if score < face_score_min:
+            continue
+        face_box = np.array([x, y, x + fw, y + fh], dtype=np.float32) * scale
+        if min(face_box[2] - face_box[0], face_box[3] - face_box[1]) < MIN_FACE_SIDE:
+            continue
 
-        if (conf >= PERSON_SAVE_CONF and person_h >= MIN_PERSON_H
-                and not (SKIP_EDGE_PERSONS and cut)):
-            saver.try_save('person', tid, frame, ob, float(conf), seq, now)
+        person_box = np.asarray(boxes[i], dtype=np.float32) * scale
+        person_conf = float(confs[i])
+        if person_conf < PERSON_SAVE_CONF or (person_box[3] - person_box[1]) < MIN_PERSON_H:
+            continue
+        if SKIP_EDGE_PERSONS and (
+                person_box[0] <= EDGE_PX or person_box[1] <= EDGE_PX or
+                person_box[2] >= frame_w - EDGE_PX or person_box[3] >= frame_h - EDGE_PX):
+            continue
 
-        face = face_of.get(i)
-        if face is not None:
-            x, y, fw, fh, score = face
-            fb = np.array([x, y, x + fw, y + fh], dtype=np.float32) * scale
-            if (score >= FACE_SAVE_SCORE and (fb[2] - fb[0]) >= MIN_FACE_SIDE
-                    and (fb[3] - fb[1]) >= MIN_FACE_SIDE):
-                saver.try_save('face', tid, frame, fb, float(score), seq, now)
+        saver.try_save_pair(tid, frame, person_box, face_box,
+                            person_conf, float(score), seq, now)
 
 
 # --------------------------------------------------------------------------
@@ -398,10 +433,25 @@ def key_pressed_exit():
     return (cv2.waitKey(1) & 0xFF) in (ord('q'), ord('Q'), 27)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    parser.add_argument(
+        '--face-score', type=float, default=FACE_SAVE_SCORE, metavar='P',
+        help=f'min face probability (0..1) to save a sample '
+             f'(default {FACE_SAVE_SCORE})')
+    args = parser.parse_args()
+    if not 0.0 <= args.face_score <= 1.0:
+        parser.error('--face-score must be between 0 and 1')
+    return args
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def main():
+    args = parse_args()
+    face_score_min = args.face_score
+
     rtsp_url = (getattr(config, 'RTSP_URL', None) or '').strip()
     if not rtsp_url:
         raise SystemExit('RTSP_URL is empty. Set it in config.py or the environment.')
@@ -418,8 +468,12 @@ def main():
     print(f'[INIT] YOLO model: {model_path}, tracker: {TRACKER}')
     model = YOLO(model_path)
 
+    # The detector must not filter out faces that the save threshold allows.
+    detector_thr = min(FACE_CONF, face_score_min)
     face_detector = cv2.FaceDetectorYN.create(
-        str(YUNET_PATH), '', (320, 320), FACE_CONF, 0.3, 5000)
+        str(YUNET_PATH), '', (320, 320), detector_thr, 0.3, 5000)
+    print(f'[INIT] Face score: detect >= {detector_thr:.2f}, '
+          f'save >= {face_score_min:.2f}')
 
     # Warm-up through track() so the tracker is registered from the first call.
     model.track(np.zeros((720, PROCESS_WIDTH, 3), np.uint8), persist=True,
@@ -490,17 +544,18 @@ def main():
                 faces = detect_faces_full(face_detector, small)
             t_face = time.perf_counter()
 
-            # --- Save crops (BEFORE drawing: small may be the same array as frame) ---
+            # --- Save pairs (BEFORE drawing: small may be the same array as frame) ---
             if saver is not None:
-                save_detections(saver, frame, xyxy, confs, ids, faces, scale, last_seq)
+                save_detections(saver, frame, xyxy, confs, ids, faces, scale,
+                                last_seq, face_score_min)
 
             # --- Draw on the small frame ---
             for box, conf, tid in zip(xyxy, confs, ids):
                 tag = f'#{int(tid)} ' if tid >= 0 else ''
                 draw_box(small, box, f'{tag}Person {conf:.2f}', (0, 220, 0))
             for (x, y, fw, fh, score) in faces:
-                draw_box(small, (x, y, x + fw, y + fh),
-                         f'Face {score:.2f}', (255, 180, 0))
+                color = (255, 180, 0) if score >= face_score_min else (120, 120, 120)
+                draw_box(small, (x, y, x + fw, y + fh), f'Face {score:.2f}', color)
 
             # FPS over the whole loop (includes decode wait, display, waitKey).
             now = time.perf_counter()
@@ -514,8 +569,7 @@ def main():
                      f'Face {1000 * (t_face - t_yolo):.0f}ms | '
                      f'{fps_ema:.1f} FPS')
             if saver is not None:
-                stats += (f' | Saved P {saver.totals["person"]} '
-                          f'F {saver.totals["face"]}')
+                stats += f' | Saved: {saver.tracks} tracks, {saver.pairs} pairs'
             draw_stats(small, stats)
 
             cv2.imshow(WINDOW, small)
@@ -530,7 +584,7 @@ def main():
         reader.stop()
         reader.join(timeout=TIMEOUT_MS / 1000 + 1)
         if saver is not None:
-            saver.close()  # waits until all queued images are written
+            saver.close()  # waits until all queued samples are written
         cv2.destroyAllWindows()
         print('[INFO] Stopped')
 
