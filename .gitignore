@@ -229,6 +229,7 @@ __pycache__/
 .vscode/
 .venv_face_detect/
 .venv_face_detect
+venv_face_detect/
 *.zip
 config.py
 dataset/
