@@ -23,6 +23,13 @@ Changing the face probability threshold
 - edit FACE_SAVE_SCORE below, or
 - run:  python main_new.py --face-score 0.9
 
+Identification (optional)
+-------------------------
+  python main_new.py --identify --gallery gallery.npz
+Every tracked person with a good face is compared with the gallery built by
+face_id.py (ArcFace); the track label is a majority vote over recent frames.
+Known people are drawn as "#3 Name 0.62", others as "#3 Person 0.91" in orange.
+
 Other points
 ------------
 - A background thread reads the stream and keeps only the latest frame,
@@ -37,6 +44,7 @@ import os
 import queue
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +56,10 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+# Detected face: box (x, y, w, h) + score in SMALL-frame coordinates,
+# lm = 5 YuNet landmarks (5x2) in ORIGINAL-frame coordinates (ArcFace alignment).
+Face = namedtuple('Face', 'x y w h score lm')
 
 BASE = Path(__file__).resolve().parent
 YUNET_PATH = BASE / 'models' / 'face_detection_yunet_2023mar.onnx'
@@ -95,6 +107,10 @@ FACE_MARGIN = 0.25        # extra margin around the face box (fraction)
 # Blur filter for the face: Laplacian variance of the crop downscaled to
 # <=128 px. Values are written to metadata.csv, so tune after a first run.
 MIN_SHARP_FACE = 15.0
+
+# ---- Identification (needs face_id.py, onnxruntime, ArcFace model) --------
+ID_INTERVAL_S = 0.5       # identify each track at most this often
+ID_WINDOW = 8             # majority vote over the last N results of a track
 
 WINDOW = 'RTSP 4K | Persons + Faces | Q/ESC=exit'
 
@@ -315,7 +331,7 @@ def assign_faces_to_persons(faces, boxes):
         return best
     areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     for face in faces:
-        x, y, fw, fh, score = face
+        x, y, fw, fh, score = face[:5]
         cx, cy = x + fw / 2, y + fh / 2
         cands = [i for i, b in enumerate(boxes)
                  if b[0] <= cx <= b[2] and b[1] <= cy <= b[3]]
@@ -345,7 +361,7 @@ def save_detections(saver, frame, boxes, confs, ids, faces, scale, seq,
         if tid < 0:
             continue  # tracker has not assigned an id yet
 
-        x, y, fw, fh, score = face
+        x, y, fw, fh, score = face[:5]
         if score < face_score_min:
             continue
         face_box = np.array([x, y, x + fw, y + fh], dtype=np.float32) * scale
@@ -472,18 +488,20 @@ def no_signal_canvas(width=PROCESS_WIDTH):
     return canvas
 
 
-def detect_faces_full(face_detector, small):
-    """YuNet on the whole downscaled frame. Returns list of (x, y, w, h, score)."""
+def detect_faces_full(face_detector, small, scale):
+    """YuNet on the whole downscaled frame. Returns a list of Face."""
     h, w = small.shape[:2]
     face_detector.setInputSize((w, h))
     _, faces = face_detector.detect(small)
     if faces is None:
         return []
-    return [(f[0], f[1], f[2], f[3], float(f[-1])) for f in faces]
+    return [Face(f[0], f[1], f[2], f[3], float(f[-1]),
+                 (f[4:14].reshape(5, 2) * scale).astype(np.float32))
+            for f in faces]
 
 
 def detect_faces_in_persons(face_detector, frame, person_boxes_small, scale):
-    """YuNet on crops of the original frame. Returns faces in SMALL-frame coords."""
+    """YuNet on crops of the original frame. Returns a list of Face (box in SMALL coords)."""
     orig_h, orig_w = frame.shape[:2]
     result = []
     for (x1, y1, x2, y2) in person_boxes_small:
@@ -506,8 +524,10 @@ def detect_faces_in_persons(face_detector, frame, person_boxes_small, scale):
             continue
         for f in faces:
             fx, fy, fw, fh = f[:4]
-            result.append(((fx + cx1) / scale, (fy + cy1) / scale,
-                           fw / scale, fh / scale, float(f[-1])))
+            lm = f[4:14].reshape(5, 2) + np.array([cx1, cy1], np.float32)
+            result.append(Face((fx + cx1) / scale, (fy + cy1) / scale,
+                               fw / scale, fh / scale, float(f[-1]),
+                               lm.astype(np.float32)))
     return result
 
 
@@ -521,6 +541,18 @@ def parse_args():
         '--face-score', type=float, default=FACE_SAVE_SCORE, metavar='P',
         help=f'min face probability (0..1) to save a sample '
              f'(default {FACE_SAVE_SCORE})')
+    parser.add_argument(
+        '--identify', action='store_true',
+        help='identify people with the ArcFace gallery (see face_id.py)')
+    parser.add_argument(
+        '--gallery', default=None, metavar='FILE',
+        help='gallery .npz built by "face_id.py build" (implies --identify; '
+             'default: gallery.npz next to the script)')
+    parser.add_argument(
+        '--id-threshold', type=float, default=None, metavar='T',
+        help='min cosine similarity to accept an identity '
+             '(default: face_id.DEFAULT_THRESHOLD; calibrate with '
+             '"face_id.py evaluate")')
     args = parser.parse_args()
     if not 0.0 <= args.face_score <= 1.0:
         parser.error('--face-score must be between 0 and 1')
@@ -556,6 +588,23 @@ def main():
         str(YUNET_PATH), '', (320, 320), detector_thr, 0.3, 5000)
     print(f'[INIT] Face score: detect >= {detector_thr:.2f}, '
           f'save >= {face_score_min:.2f}')
+
+    identifier = None
+    if args.identify or args.gallery:
+        try:
+            import face_id
+            gallery = face_id.Gallery.load(args.gallery or face_id.GALLERY_PATH)
+            thr = (args.id_threshold if args.id_threshold is not None
+                   else face_id.DEFAULT_THRESHOLD)
+            embedder = face_id.ArcFace()
+            identifier = face_id.TrackIdentifier(
+                gallery, embedder, threshold=thr,
+                interval_s=ID_INTERVAL_S, window=ID_WINDOW)
+        except (FileNotFoundError, ImportError) as e:
+            raise SystemExit(f'Identification unavailable: {e}')
+        print(f'[INIT] Identification: {len(gallery.names)} people, '
+              f'{len(gallery)} embeddings, threshold {thr:.2f}, '
+              f'ArcFace on {embedder.providers[0]}')
 
     # Warm-up through track() so the tracker is registered from the first call.
     model.track(np.zeros((720, PROCESS_WIDTH, 3), np.uint8), persist=True,
@@ -625,13 +674,24 @@ def main():
             if FACES_IN_PERSON_CROPS:
                 faces = detect_faces_in_persons(face_detector, frame, xyxy, scale)
             else:
-                faces = detect_faces_full(face_detector, small)
+                faces = detect_faces_full(face_detector, small, scale)
             t_face = time.perf_counter()
 
             # --- Save pairs (BEFORE drawing: small may be the same array as frame) ---
             if saver is not None:
                 save_detections(saver, frame, xyxy, confs, ids, faces, scale,
                                 last_seq, face_score_min)
+
+            # --- Identify (BEFORE drawing: needs clean pixels) ---
+            if identifier is not None:
+                now_t = time.time()
+                for i, face in assign_faces_to_persons(faces, xyxy).items():
+                    tid = int(ids[i])
+                    if (tid < 0 or face.score < face_score_min
+                            or min(face.w, face.h) * scale < MIN_FACE_SIDE
+                            or not identifier.due(tid, now_t)):
+                        continue
+                    identifier.update(tid, frame, face.lm, now_t)
 
             # --- Overlay (sizes follow the real window size) ---
             if not window_sized:  # match window aspect ratio to the stream once
@@ -641,9 +701,18 @@ def main():
             ui = ui_scale(w)
 
             for box, conf, tid in zip(xyxy, confs, ids):
-                tag = f'#{int(tid)} ' if tid >= 0 else ''
-                draw_box(small, box, f'{tag}Person {conf:.2f}', (0, 220, 0), ui)
-            for (x, y, fw, fh, score) in faces:
+                tid = int(tid)
+                tag = f'#{tid} ' if tid >= 0 else ''
+                label, color = f'{tag}Person {conf:.2f}', (0, 220, 0)
+                if identifier is not None and tid >= 0:
+                    who = identifier.label(tid)
+                    if who is not None and who[0] != identifier.UNKNOWN:
+                        label = f'{tag}{who[0]} {who[1]:.2f}'
+                    elif who is not None:
+                        color = (0, 140, 255)      # identified as Unknown
+                draw_box(small, box, label, color, ui)
+            for face in faces:
+                x, y, fw, fh, score = face[:5]
                 color = (255, 180, 0) if score >= face_score_min else (150, 150, 150)
                 draw_box(small, (x, y, x + fw, y + fh), f'Face {score:.2f}',
                          color, ui)
@@ -658,6 +727,8 @@ def main():
                      f'YOLO {1000 * (t_yolo - t0):.0f} ms | '
                      f'Face {1000 * (t_face - t_yolo):.0f} ms')
             line2 = f'Persons {len(xyxy)} | Faces {len(faces)}'
+            if identifier is not None:
+                line2 += f' | ID: {len(identifier.gallery.names)} people'
             if saver is not None:
                 line2 += f' | Saved: {saver.tracks} tracks, {saver.pairs} pairs'
             draw_status(small, [line1, line2], ui)
