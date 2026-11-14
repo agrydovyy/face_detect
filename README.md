@@ -80,3 +80,17 @@ Pipeline: face -> YuNet 5 landmarks -> similarity warp to 112x112 -> ArcFace (ON
 - **Overlay.** Known people are drawn as `#3 Name 0.62`, unidentified people keep the default green `#3 Person 0.91`, and people identified as Unknown are drawn in orange. The status bar shows `ID: N people` when identification is on.
 - **Startup log.** Prints the number of people and embeddings in the gallery, the threshold and the ONNX provider used by ArcFace.
 - Module docstring extended with a short "Identification" section.
+
+
+## main_new.py: identity labels in the dataset metadata
+
+Changes compared:
+
+- **Identity columns in `metadata.csv`.** Two new columns, `identity` and `identity_score`, are written for every saved pair:
+  - `identity`: `Name`, `Unknown`, or `pending` (the track has no label yet); empty if identification is off (no `--identify` / `--gallery`);
+  - `identity_score`: similarity to that identity (empty if there is none).
+- **Identification does not filter the dataset.** Known and unknown people are all saved; the new columns only make it possible to tell them apart later. The label is the one the track had at the moment of saving (a majority vote over recent frames), so early samples of a track can be wrong; for dataset preparation the most frequent identity over the whole track should be preferred.
+- **Processing order changed.** Identification now runs before saving (and before drawing), so a saved sample already carries the current label of its track.
+- **API changes.** `try_save_pair` accepts an optional `identity=(name, score)` argument, and `save_detections` accepts an optional `identifier`. The "New track" log line now also prints the identity when it is known.
+- **Stricter face size filter.** `MIN_FACE_SIDE` was raised from 48 to 80 px (in the original frame), so smaller faces are neither saved nor identified.
+- Module docstring extended with a description of the new columns.
