@@ -230,6 +230,7 @@ __pycache__/
 .venv_face_detect/
 .venv_face_detect
 venv_face_detect/
+identities/
 *.zip
 config.py
 dataset/
