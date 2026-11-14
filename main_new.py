@@ -101,7 +101,7 @@ PERSON_MARGIN = 0.05      # extra margin around the person box (fraction)
 SKIP_EDGE_PERSONS = False  # True: also skip people cut by the frame border
 EDGE_PX = 3
 
-MIN_FACE_SIDE = 48        # px, in the ORIGINAL frame
+MIN_FACE_SIDE = 75        # px, in the ORIGINAL frame (48px old value)
 FACE_MARGIN = 0.25        # extra margin around the face box (fraction)
 
 # Blur filter for the face: Laplacian variance of the crop downscaled to
