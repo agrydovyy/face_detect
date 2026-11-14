@@ -52,3 +52,31 @@ Changes compared to `main_new_1.py`:
   The font shrinks automatically on very narrow frames.
 - **"NO SIGNAL" screen.** The placeholder now has a 16:9 height computed from the width and uses the same scaling as the rest of the overlay.
 - **Overlay settings.** New constants: `WINDOW_INIT_WIDTH`, `UI_REF_WIDTH`, `FONT`, `BOX_FONT`, `BOX_LINE`, `STATUS_FONT`. Below-threshold faces are now drawn in a lighter gray (150, 150, 150) for better visibility.
+
+
+## face_id.py (new): face identification with ArcFace
+
+Identifies people on top of the existing YuNet detector. No training is needed: the labelled dataset (`identities/person_001/faces/*.jpg`) is turned into a gallery of embeddings, and new people are added by rebuilding the gallery.
+
+Pipeline: face -> YuNet 5 landmarks -> similarity warp to 112x112 -> ArcFace (ONNX, `w600k_r50.onnx`, 512-d L2-normalised embedding) -> cosine similarity against the gallery -> identity or `Unknown`.
+
+- **Alignment and embedding.** `similarity_transform` (Umeyama) + `align_face` warp the face to the standard ArcFace landmark template. `ArcFace` runs the ONNX model on CUDA when available, otherwise on CPU.
+- **`YuNetDetector` wrapper.** Returns landmarks and also works on small face crops (small crops are upscaled, very large images are downscaled before detection).
+- **`Gallery`.** Stores embeddings, labels and file paths in a `.npz` file. The score of an identity is the mean of its `TOPK` (3) best similarities. Supports `save`, `load`, `scores` and `identify`.
+- **`TrackIdentifier`.** Keeps a stable identity per tracker id. Each track is identified at most every `interval_s` seconds, and the label is a strict majority vote over the last `window` results (results below the threshold vote for `Unknown`), which removes single-frame flicker.
+- **CLI commands:**
+  - `build`: builds the gallery from the `identities/` folder and prints a quality report (images that look unlike the rest of their identity, and identity pairs that look like one person, i.e. possibly unmerged tracks);
+  - `evaluate`: closed-set top-1 accuracy (k-fold by contiguous blocks), open-set test (leave one identity out), TAR/FAR table over thresholds and a suggested threshold;
+  - `identify`: identifies faces in an image or folder and can save annotated images.
+- Default similarity threshold is `DEFAULT_THRESHOLD = 0.40` and should be calibrated with `evaluate` on real data.
+- Requires `onnxruntime` (or `onnxruntime-gpu`) and the ArcFace model in `models/`.
+
+## main_new.py: live identification mode
+
+
+- **New `--identify` mode.** `python main_new.py --identify --gallery gallery.npz` compares every tracked person who has a good face with the gallery. New options: `--identify`, `--gallery FILE` (implies `--identify`) and `--id-threshold T` (minimum cosine similarity; defaults to `face_id.DEFAULT_THRESHOLD`). If the gallery or the model is missing, the program exits with a clear message.
+- **`Face` namedtuple.** Faces now carry `x, y, w, h, score` plus `lm`, the 5 YuNet landmarks in original-frame coordinates (needed for ArcFace alignment). `detect_faces_full` and `detect_faces_in_persons` return `Face` objects, and all other code reads only the first five fields, so the saving logic is unchanged.
+- **Identification step in the main loop.** It runs before drawing (to use clean pixels) and only for faces assigned to a tracked person, with score >= the save threshold, big enough (`MIN_FACE_SIDE`) and due according to `ID_INTERVAL_S` (0.5 s). The track label is the majority vote over the last `ID_WINDOW` (8) results.
+- **Overlay.** Known people are drawn as `#3 Name 0.62`, unidentified people keep the default green `#3 Person 0.91`, and people identified as Unknown are drawn in orange. The status bar shows `ID: N people` when identification is on.
+- **Startup log.** Prints the number of people and embeddings in the gallery, the threshold and the ONNX provider used by ArcFace.
+- Module docstring extended with a short "Identification" section.
