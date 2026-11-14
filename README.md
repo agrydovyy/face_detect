@@ -26,3 +26,15 @@ Changes compared to the previous version (`main_new_old.py`):
 - **Quality filters simplified.** The blur filter is applied to the face only (`MIN_SHARP_FACE`); the person blur filter (`MIN_SHARP_PERSON`) was removed. Person sharpness is still logged to the CSV. `SKIP_EDGE_PERSONS` now defaults to `False`, so people cut by the frame border are saved if their face is valid.
 - **UI.** Faces below the save threshold are drawn in gray, faces that qualify for saving in orange. The stats bar and the final log now show the number of saved tracks and person+face pairs instead of separate person and face counters.
 - **Docs.** The module docstring was rewritten to describe the saving rules, the dataset layout and the new CLI option.
+
+## update main_new.py: dataset layout grouped by track
+
+Changes compared to `main_new.py`:
+
+- **New dataset folder structure.** Each track now has its own folder containing both crop types:
+  `dataset/<YYYYMMDD_HHMMSS>/track_XXXX/persons/fNNNNNNNN.jpg` and
+  `dataset/<YYYYMMDD_HHMMSS>/track_XXXX/faces/fNNNNNNNN.jpg`.
+  Previously the layout was `persons/track_XXXX/` and `faces/track_XXXX/`. Now all images of one person visit are in a single folder, which makes it easier to review, label or delete one track.
+- **Session + track as a unique key.** Track ids restart in every session, so the session folder name (start time) together with the track id uniquely identifies one person visit.
+- `metadata.csv` keeps the same columns; `person_file` and `face_file` now contain the new relative paths (`track_XXXX/persons/...`, `track_XXXX/faces/...`).
+- Module docstring updated to describe the new layout.
