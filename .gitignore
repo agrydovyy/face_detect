@@ -235,3 +235,4 @@ identities/
 config.py
 dataset/
 *.old
+*.npz
