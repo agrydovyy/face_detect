@@ -236,3 +236,4 @@ config.py
 dataset/
 *.old
 *.npz
+gallery.npz
